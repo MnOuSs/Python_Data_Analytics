@@ -1,3 +1,16 @@
+"""
+Replays the Environmental Sensor Telemetry dataset as a live Kafka stream.
+
+Each CSV row is published to the 'sensor-readings' topic, keyed by device ID so
+that readings from one sensor station always land in the same partition and keep
+their order. The delay between messages is derived from the original timestamps
+divided by SPEED_FACTOR, so the stream keeps the shape of the real data instead
+of firing rows at a flat rate.
+
+The producer is a one-shot job: it publishes the file and exits. It never talks
+to MongoDB, which is what lets ingestion continue while the storage side is down.
+"""
+
 import csv
 import json
 import logging
@@ -15,7 +28,8 @@ TOPIC = os.getenv("KAFKA_TOPIC", "sensor-readings")
 PARTITIONS = int(os.getenv("TOPIC_PARTITIONS", "3"))
 CSV_PATH = os.getenv(
     "CSV_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "iot_telemetry_data.csv"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data",
+                 "iot_telemetry_data.csv"),
 )
 SPEED_FACTOR = float(os.getenv("SPEED_FACTOR", "1000"))
 MAX_SLEEP = float(os.getenv("MAX_SLEEP", "2.0"))
@@ -28,15 +42,38 @@ log = logging.getLogger("producer")
 
 
 def to_bool(value):
-    """The CSV stores booleans as the strings 'true'/'false'.
+    """Convert the CSV's string booleans into real booleans.
 
-    bool('false') is True in Python, so this must be explicit.
+    The dataset stores these fields as the text 'true' and 'false'. Python
+    evaluates bool('false') as True, so the conversion has to be explicit or
+    every reading would silently claim motion and light were detected.
+
+    Args:
+        value: The raw field value from the CSV.
+
+    Returns:
+        True only if the text reads 'true', ignoring case and surrounding space.
     """
     return str(value).strip().lower() == "true"
 
 
 def parse_row(row):
-    """Convert one raw CSV row into a typed reading."""
+    """Convert one raw CSV row into a typed reading ready to publish.
+
+    Three quirks of the source data are handled here: timestamps arrive as Unix
+    epoch floats in scientific notation, the boolean fields are strings, and
+    temperature carries float32 rounding artefacts such as 19.700000762939453.
+
+    Args:
+        row: One row from csv.DictReader.
+
+    Returns:
+        A dict with typed fields and an ISO-8601 UTC timestamp.
+
+    Raises:
+        ValueError: If a numeric field cannot be parsed.
+        KeyError: If an expected column is missing.
+    """
     epoch = float(row["ts"])  # written in scientific notation, e.g. 1.59451209E9
     return {
         "timestamp": datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(),
@@ -53,7 +90,21 @@ def parse_row(row):
 
 
 def wait_for_broker(retries=30, delay=2):
-    """Kafka may still be starting when this container does. Retry, don't crash."""
+    """Open an admin connection, retrying until Kafka is reachable.
+
+    This container can start before the broker finishes booting, so a failed
+    first attempt is expected rather than fatal.
+
+    Args:
+        retries: How many attempts to make before giving up.
+        delay: Seconds to wait between attempts.
+
+    Returns:
+        A connected KafkaAdminClient.
+
+    Raises:
+        SystemExit: If the broker is still unreachable after all retries.
+    """
     for attempt in range(1, retries + 1):
         try:
             admin = KafkaAdminClient(bootstrap_servers=BOOTSTRAP)
@@ -67,7 +118,15 @@ def wait_for_broker(retries=30, delay=2):
 
 
 def ensure_topic(admin):
-    """Create the topic if it does not exist, so a fresh clone runs unattended."""
+    """Create the topic if it does not already exist.
+
+    Automatic topic creation is disabled on the broker so that a typo fails
+    loudly instead of quietly making an empty topic. Creating it here means a
+    fresh clone of the repository runs with no manual setup step.
+
+    Args:
+        admin: A connected KafkaAdminClient.
+    """
     try:
         admin.create_topics([
             NewTopic(name=TOPIC, num_partitions=PARTITIONS, replication_factor=1)
@@ -78,6 +137,14 @@ def ensure_topic(admin):
 
 
 def main():
+    """Publish the whole dataset to Kafka, then exit.
+
+    Messages are keyed by device ID so each station's readings stay ordered
+    within one partition. acks='all' makes the producer wait for the broker to
+    confirm each write, and limiting in-flight requests to one keeps ordering
+    intact if a retry fires. Malformed rows are logged and skipped rather than
+    aborting the run.
+    """
     admin = wait_for_broker()
     ensure_topic(admin)
     admin.close()
@@ -99,7 +166,7 @@ def main():
     sent = 0
     previous_epoch = None
 
-    with open(CSV_PATH, newline="") as handle:
+    with open(CSV_PATH, newline="", encoding="UTF-8") as handle:
         for row in csv.DictReader(handle):
             try:
                 reading = parse_row(row)
