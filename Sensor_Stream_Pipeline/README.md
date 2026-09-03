@@ -181,6 +181,7 @@ directly against the broker from the host, which is useful during development.
 ```
 .
 ├── docker-compose.yml
+├── explore.ipynb             
 ├── data/                     
 ├── producer/
 │   ├── producer.py
