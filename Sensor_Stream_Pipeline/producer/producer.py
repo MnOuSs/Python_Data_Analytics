@@ -74,7 +74,7 @@ def parse_row(row):
         ValueError: If a numeric field cannot be parsed.
         KeyError: If an expected column is missing.
     """
-    epoch = float(row["ts"])  # written in scientific notation, e.g. 1.59451209E9
+    epoch = float(row["ts"])
     return {
         "timestamp": datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(),
         "epoch": epoch,
@@ -153,9 +153,9 @@ def main():
         bootstrap_servers=BOOTSTRAP,
         key_serializer=lambda k: k.encode("utf-8"),
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        acks="all",   # wait for the broker to confirm the write
+        acks="all",
         retries=5,
-        max_in_flight_requests_per_connection=1,  # keep order when a retry fires
+        max_in_flight_requests_per_connection=1,
         linger_ms=50,
     )
 

@@ -29,8 +29,6 @@ MONGO_URI = os.getenv(
 MONGO_DB = os.getenv("MONGO_DB", "sensordata")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 
-# Thresholds are the 99th percentile of each metric per device, so roughly the
-# top one per cent of a station's readings counts as an exceedance.
 THRESHOLDS_PATH = os.getenv(
     "THRESHOLDS_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json"),
@@ -115,7 +113,7 @@ def connect_kafka(retries=30, delay=2):
                 group_id=GROUP_ID,
                 value_deserializer=lambda v: json.loads(v.decode("utf-8")),
                 auto_offset_reset="earliest",
-                enable_auto_commit=False,  # commit only after a successful write
+                enable_auto_commit=False,
                 max_poll_records=BATCH_SIZE,
                 api_version=(2, 6, 0),
             )
