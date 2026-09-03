@@ -123,7 +123,7 @@ Requirements: Docker Desktop. Nothing else is installed locally — Kafka,
 MongoDB, the producer and the consumer all run as containers.
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/MnOuSs/Python_Data_Analytics/tree/main/Sensor_Stream_Pipeline
 cd sensor-stream-pipeline
 
 # place the Kaggle CSV at data/iot_telemetry_data.csv
