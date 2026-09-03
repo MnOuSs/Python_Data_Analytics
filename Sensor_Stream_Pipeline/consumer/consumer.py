@@ -29,9 +29,8 @@ MONGO_URI = os.getenv(
 MONGO_DB = os.getenv("MONGO_DB", "sensordata")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 
-# Derived from the 99th percentile of each metric in the source dataset, so that
-# roughly the top one per cent of readings is treated as an exceedance.
-
+# Thresholds are the 99th percentile of each metric per device, so roughly the
+# top one per cent of a station's readings counts as an exceedance.
 THRESHOLDS_PATH = os.getenv(
     "THRESHOLDS_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json"),
@@ -48,11 +47,36 @@ log = logging.getLogger("consumer")
 
 
 def reading_id(reading):
-    """Deterministic ID: the same reading always maps to the same document."""
+    """Build the deterministic document ID for a reading.
+
+    The same reading always maps to the same ID, so re-processing a message
+    overwrites its own document rather than creating a duplicate.
+
+    Args:
+        reading: A parsed reading with 'device' and 'epoch' keys.
+
+    Returns:
+        A string of the form '<device>_<epoch>'.
+    """
     return f"{reading['device']}_{reading['epoch']}"
 
 
 def connect_mongo(retries=30, delay=2):
+    """Open a MongoDB connection, retrying until the database is reachable.
+
+    The container may start before MongoDB is ready, so a failed first attempt
+    is expected rather than fatal.
+
+    Args:
+        retries: How many attempts to make before giving up.
+        delay: Seconds to wait between attempts.
+
+    Returns:
+        A connected MongoClient.
+
+    Raises:
+        SystemExit: If the database is still unreachable after all retries.
+    """
     for attempt in range(1, retries + 1):
         try:
             client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
@@ -67,6 +91,22 @@ def connect_mongo(retries=30, delay=2):
 
 
 def connect_kafka(retries=30, delay=2):
+    """Subscribe to the Kafka topic, retrying until the broker is reachable.
+
+    Auto-commit is disabled so that offsets advance only after a successful
+    write to MongoDB. If this process dies mid-batch, Kafka redelivers those
+    messages on restart instead of skipping them.
+
+    Args:
+        retries: How many attempts to make before giving up.
+        delay: Seconds to wait between attempts.
+
+    Returns:
+        A subscribed KafkaConsumer.
+
+    Raises:
+        SystemExit: If the broker is still unreachable after all retries.
+    """
     for attempt in range(1, retries + 1):
         try:
             consumer = KafkaConsumer(
@@ -77,7 +117,7 @@ def connect_kafka(retries=30, delay=2):
                 auto_offset_reset="earliest",
                 enable_auto_commit=False,  # commit only after a successful write
                 max_poll_records=BATCH_SIZE,
-                api_version=(2, 6, 0)                
+                api_version=(2, 6, 0),
             )
             log.info("Connected to Kafka at %s", BOOTSTRAP)
             return consumer
@@ -89,6 +129,15 @@ def connect_kafka(retries=30, delay=2):
 
 
 def setup_collections(db):
+    """Create the indexes the end-user applications query on.
+
+    Planners filter readings by device and time range; the warning application
+    reads recent alerts per device. Index creation is idempotent, so this is
+    safe to run on every start.
+
+    Args:
+        db: The MongoDB database handle.
+    """
     db.readings.create_index([("device", ASCENDING), ("epoch", ASCENDING)])
     db.readings.create_index([("timestamp", ASCENDING)])
     db.alerts.create_index([("device", ASCENDING), ("timestamp", ASCENDING)])
@@ -96,7 +145,20 @@ def setup_collections(db):
 
 
 def find_breaches(reading):
-    """Return one alert per metric exceeding this device's own threshold."""
+    """Check a reading against its own station's thresholds.
+
+    Each device is judged against its own baseline, so an alert means the value
+    is unusual for that location rather than unusual across the whole network.
+    Devices with no configured entry fall back to the default thresholds, which
+    covers newly installed sensors without a code change.
+
+    Args:
+        reading: A parsed reading.
+
+    Returns:
+        A list of alert documents, one per metric exceeding its threshold.
+        Empty if nothing was exceeded.
+    """
     device = reading["device"]
     limits = DEVICE_THRESHOLDS.get(device, DEFAULT_THRESHOLDS)
     known = device in DEVICE_THRESHOLDS
@@ -120,6 +182,14 @@ def find_breaches(reading):
 
 
 def main():
+    """Run the consume-store-alert loop until interrupted.
+
+    Each poll returns a batch of messages. Readings and any resulting alerts are
+    written to MongoDB as bulk upserts, and only once those writes succeed are
+    the Kafka offsets committed. That ordering is what makes the pipeline
+    recoverable: a crash mid-batch loses no data, and the redelivered messages
+    overwrite their own documents instead of duplicating them.
+    """
     mongo = connect_mongo()
     db = mongo[MONGO_DB]
     setup_collections(db)
