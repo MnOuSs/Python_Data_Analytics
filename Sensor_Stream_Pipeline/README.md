@@ -63,8 +63,8 @@ second one. At-least-once delivery combined with idempotent writes yields
 exactly-once *storage*, which is the guarantee that matters for the end users.
 
 This was verified by killing the consumer mid-stream (`docker compose kill
-consumer`) while the producer continued publishing, then restarting it. The
-final document counts were identical to an uninterrupted run.
+consumer`) after 8,500 readings while the producer continued publishing, then
+restarting it. The final document counts were identical to an uninterrupted run.
 
 ## Scalability and maintainability
 
@@ -73,12 +73,27 @@ instances in the same group divide the partitions between them without code
 changes. MongoDB shards on the same key if the reading volume outgrows a single
 node. Nothing in the design assumes a single machine.
 
-**Maintainability.** Alert thresholds live in `consumer/thresholds.json`, not in
-code, so operators adjust them without a redeployment. A `default` block applies
-to any device not explicitly listed, so newly installed sensors are covered
-immediately. MongoDB's document model absorbs additional metrics from future
-sensor hardware without a schema migration — a requirement of the project, since
-the structure of data from planned advanced sensors is not yet known.
+**Maintainability.** Alert thresholds and station names live in
+`consumer/thresholds.json`, not in code, so operators adjust them without a
+redeployment. A `default` block applies to any device not explicitly listed, so
+newly installed sensors are covered immediately. MongoDB's document model
+absorbs additional metrics from future sensor hardware without a schema
+migration — a requirement of the project, since the structure of data from
+planned advanced sensors is not yet known.
+
+## Indexing
+
+Each index follows from an expected usage rather than from the shape of the
+data:
+
+| Collection | Index | Serves |
+|---|---|---|
+| `readings` | `device`, `epoch` | Planner dashboards: one station's history over a time range |
+| `readings` | `timestamp` | Planner dashboards: network-wide trends in chronological order |
+| `alerts` | `device`, `epoch` desc | Warning application: most recent alerts at a given station |
+| `alerts` | `severity`, `epoch` desc | Warning application: severe alerts currently active anywhere |
+
+Index creation runs on every consumer start and is idempotent.
 
 ## Sample data
 
@@ -117,6 +132,42 @@ this location".
 Alerting metrics are CO, smoke, LPG and temperature. Humidity is stored but not
 alerted on, as a high relative humidity is not in itself a hazard.
 
+A reading must exceed its threshold by at least 2% before an alert is raised.
+Percentile-derived thresholds produce a dense band of readings sitting
+fractionally above the line: without this margin, 38% of alerts (5,699 of
+15,001) fall within 2% of their threshold, several hundred of them exceeding it
+by less than one part in a million. Such alerts are arithmetically correct but
+carry no information, and an alerting system that cries wolf is one citizens
+learn to ignore. The margin trades a small loss of sensitivity for alerts that
+mean something.
+
+## Alert documents
+
+Alerts are written so the citizen warning application can render them directly,
+without interpreting raw sensor values:
+
+```json
+{
+  "station": "Station 1 - Riverside Park",
+  "message": "Carbon monoxide moderate at Station 1 - Riverside Park",
+  "severity": "moderate",
+  "metric_label": "carbon monoxide",
+  "value": 0.009464507364341408,
+  "threshold": 0.009254,
+  "exceedance": 0.000211
+}
+```
+
+Severity grades how far past the threshold a reading sits: `moderate` up to 25%
+above, `high` up to 50%, `severe` beyond that. Station names are configured in
+`consumer/thresholds.json` alongside the thresholds, so operators can rename a
+station or register new hardware without touching code. The raw value and
+threshold are retained for planners and for auditing; the station name, message
+and severity exist so that a non-technical reader can act on the alert.
+
+Station names are illustrative, standing in for the physical locations a
+municipality would assign to each device.
+
 ## Running the pipeline
 
 Requirements: Docker Desktop. Nothing else is installed locally — Kafka,
@@ -138,7 +189,7 @@ Follow progress with:
 docker compose logs -f consumer
 ```
 
-Check the stored results:
+Check the stored results once the consumer stops reporting new readings:
 
 ```bash
 docker compose exec mongodb mongosh -u sensor -p sensorpass \
@@ -181,7 +232,7 @@ directly against the broker from the host, which is useful during development.
 ```
 .
 ├── docker-compose.yml
-├── explore.ipynb             
+├── explore.ipynb            
 ├── data/                     
 ├── producer/
 │   ├── producer.py
@@ -199,6 +250,8 @@ directly against the broker from the host, which is useful during development.
 - Single-broker Kafka with replication factor 1. Appropriate for a prototype;
   a production deployment would run at least three brokers with a replication
   factor of 3.
+- Fixed `container_name` values keep the documented commands readable, but mean
+  only one instance of the stack can run at a time on a given machine.
 - Credentials are in plain text in `docker-compose.yml`. Acceptable for a local
   prototype, but a deployed system would use a secrets manager.
 - Kafka is pinned to 3.8.1. Version 3.9.0 contains a validation bug
