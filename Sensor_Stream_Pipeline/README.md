@@ -146,7 +146,7 @@ docker compose exec mongodb mongosh -u sensor -p sensorpass \
   --eval "print(db.readings.countDocuments({}), db.alerts.countDocuments({}))"
 ```
 
-Expected output: `405171 15001`.
+Expected output: `405171 9302`.
 
 The 13-document difference from the dataset's 405,184 rows is expected: the
 source contains 13 duplicate device/timestamp pairs, which the deterministic

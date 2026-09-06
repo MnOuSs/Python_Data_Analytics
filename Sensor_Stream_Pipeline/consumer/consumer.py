@@ -17,7 +17,7 @@ import time
 
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
-from pymongo import MongoClient, ASCENDING, UpdateOne
+from pymongo import MongoClient, ASCENDING, DESCENDING, UpdateOne
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:29092")
@@ -29,6 +29,7 @@ MONGO_URI = os.getenv(
 MONGO_DB = os.getenv("MONGO_DB", "sensordata")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 
+
 THRESHOLDS_PATH = os.getenv(
     "THRESHOLDS_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json"),
@@ -38,6 +39,7 @@ with open(THRESHOLDS_PATH, encoding="utf-8-sig") as _f:
     _config = json.load(_f)
 DEVICE_THRESHOLDS = _config["devices"]
 DEFAULT_THRESHOLDS = _config["default"]
+METRIC_LABELS = _config["labels"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("kafka").setLevel(logging.WARNING)
@@ -129,17 +131,42 @@ def connect_kafka(retries=30, delay=2):
 def setup_collections(db):
     """Create the indexes the end-user applications query on.
 
-    Planners filter readings by device and time range; the warning application
-    reads recent alerts per device. Index creation is idempotent, so this is
-    safe to run on every start.
+    Each index follows directly from an expected usage. Planners filter readings
+    by station over a time range, or scan the whole network chronologically for
+    dashboards. The citizen warning application asks for the most recent alerts
+    at one station, and for anything severe currently active across the city.
+    Index creation is idempotent, so this is safe to run on every start.
 
     Args:
         db: The MongoDB database handle.
     """
     db.readings.create_index([("device", ASCENDING), ("epoch", ASCENDING)])
     db.readings.create_index([("timestamp", ASCENDING)])
-    db.alerts.create_index([("device", ASCENDING), ("timestamp", ASCENDING)])
+    db.alerts.create_index([("device", ASCENDING), ("epoch", DESCENDING)])
+    db.alerts.create_index([("severity", ASCENDING), ("epoch", DESCENDING)])
     log.info("Indexes ensured on 'readings' and 'alerts'")
+
+
+def severity(value, limit):
+    """Grade how far past the threshold a reading sits.
+
+    The warning application shows this to citizens, who need a plain indication
+    of urgency rather than a raw measurement they cannot interpret.
+
+    Args:
+        value: The measured value.
+        limit: The threshold it exceeded.
+
+    Returns:
+        'moderate' up to 25% above the threshold, 'high' up to 50%, and
+        'severe' beyond that.
+    """
+    ratio = value / limit
+    if ratio < 1.25:
+        return "moderate"
+    if ratio < 1.5:
+        return "high"
+    return "severe"
 
 
 def find_breaches(reading):
@@ -150,6 +177,10 @@ def find_breaches(reading):
     Devices with no configured entry fall back to the default thresholds, which
     covers newly installed sensors without a code change.
 
+    Each alert carries a station name, a plain-language metric label and a
+    severity grade, so the citizen warning application can render it directly
+    without interpreting raw sensor values.
+
     Args:
         reading: A parsed reading.
 
@@ -158,23 +189,31 @@ def find_breaches(reading):
         Empty if nothing was exceeded.
     """
     device = reading["device"]
-    limits = DEVICE_THRESHOLDS.get(device, DEFAULT_THRESHOLDS)
+    config = DEVICE_THRESHOLDS.get(device, DEFAULT_THRESHOLDS)
     known = device in DEVICE_THRESHOLDS
+    limits = config["limits"]
+    station = config["name"]
 
     alerts = []
     for metric, limit in limits.items():
         value = reading.get(metric)
-        if value is not None and value > limit:
+        if value is not None and value > limit * 1.02:
+            level = severity(value, limit)
+            label = METRIC_LABELS.get(metric, metric)
             alerts.append({
                 "_id": f"{reading_id(reading)}_{metric}",
                 "device": device,
+                "station": station,
                 "timestamp": reading["timestamp"],
                 "epoch": reading["epoch"],
                 "metric": metric,
+                "metric_label": label,
                 "value": value,
                 "threshold": limit,
                 "exceedance": round(value - limit, 6),
+                "severity": level,
                 "baseline": "device" if known else "default",
+                "message": f"{label.capitalize()} {level} at {station}",
             })
     return alerts
 
@@ -225,7 +264,6 @@ def main():
                 db.alerts.bulk_write(alert_ops, ordered=False)
                 raised += len(alert_ops)
 
-            # Only now is it safe to advance the offsets.
             consumer.commit()
 
             if stored % 1000 < BATCH_SIZE:
